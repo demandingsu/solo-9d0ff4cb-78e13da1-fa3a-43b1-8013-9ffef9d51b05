@@ -8,11 +8,19 @@ Only details whose issue/edition matches the directory and which carry an
 image link may cover pages.  A page covered by two different scans is a
 rescan conflict; a page with no accepted scan is pending rescan.  Any failed
 fetch makes the whole issue "needs verification" (待核实).
+
+Image audit: every accepted scan's image is downloaded once per unique URL,
+streamed in fixed-size chunks and fingerprinted with SHA-256 over the actual
+response bytes (the whole issue is never held in memory at once).  When
+different details cover mutually disjoint sets of page numbers but their
+image bytes are identical, the details, pages and image source URLs are
+listed as image reuse.  A spread detail is a single scan and counted once.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import re
 import unicodedata
 from collections import deque
@@ -28,6 +36,8 @@ MAX_DIRECTORY_PAGES = 100
 MAX_DETAIL_PAGES = 2000
 MAX_PAGES_PER_SCAN = 300
 DETAIL_CONCURRENCY = 8
+IMAGE_CONCURRENCY = 4
+IMAGE_CHUNK_SIZE = 64 * 1024
 
 PAGINATION_MARKERS = (
     "pagination",
@@ -553,6 +563,8 @@ class ScanSource:
     issue: str
     edition: str
     notes: list[str] = field(default_factory=list)
+    sha256: str = ""
+    image_verified: bool = False
 
 
 @dataclass
@@ -587,6 +599,22 @@ class PageFinding:
 
 
 @dataclass
+class ReusedImage:
+    """Several details showing identical image bytes on disjoint page sets."""
+
+    sha256: str
+    image_urls: list[str]
+    scans: list[ScanSource]
+
+    @property
+    def page_numbers(self) -> list[int]:
+        pages: set[int] = set()
+        for scan in self.scans:
+            pages.update(scan.page_numbers)
+        return sorted(pages)
+
+
+@dataclass
 class IssueReport:
     directory_url: str
     issue_no: str
@@ -598,12 +626,41 @@ class IssueReport:
     failures: list[FetchFailure]
     directory_pages: list[str]
     warnings: list[str] = field(default_factory=list)
+    reused_images: list[ReusedImage] = field(default_factory=list)
+    unique_image_count: int = 0
+    verified_image_count: int = 0
+
+    @property
+    def image_failures(self) -> list[FetchFailure]:
+        return [failure for failure in self.failures if failure.stage == "图片"]
+
+    @property
+    def coverage_status(self) -> str:
+        if self.conflict_pages or self.missing_pages:
+            return "不合格"
+        return "合格"
+
+    @property
+    def coverage_status_key(self) -> str:
+        return "bad" if self.coverage_status == "不合格" else "ok"
+
+    @property
+    def image_status(self) -> str:
+        if self.image_failures:
+            return "待核实"
+        if self.reused_images:
+            return "不合格"
+        return "合格"
+
+    @property
+    def image_status_key(self) -> str:
+        return {"合格": "ok", "不合格": "bad", "待核实": "pending"}[self.image_status]
 
     @property
     def status(self) -> str:
         if self.failures:
             return "待核实"
-        if self.conflict_pages or self.missing_pages:
+        if self.conflict_pages or self.missing_pages or self.reused_images:
             return "不合格"
         return "合格"
 
@@ -636,6 +693,8 @@ class IssueReport:
                 extra += f" 另发现第 {'、'.join(str(n) for n in self.conflict_pages)} 页重扫冲突，"
             if self.missing_pages:
                 extra += f"第 {'、'.join(str(n) for n in self.missing_pages)} 页待补扫，"
+            if self.reused_images:
+                extra += f"已确认 {len(self.reused_images)} 组图片复用，"
             if extra:
                 extra = extra.rstrip("，") + "。"
             return (
@@ -648,7 +707,43 @@ class IssueReport:
         if self.missing_pages:
             pages = "、".join(str(number) for number in self.missing_pages)
             return f"第 {pages} 页没有有效扫描，需补扫。"
+        if self.reused_images:
+            return f"页码覆盖齐全，但发现 {len(self.reused_images)} 组不同详情复用同一扫描图片。"
         return f"全部 {self.total_pages} 页均由唯一有效扫描覆盖。"
+
+    @property
+    def coverage_note(self) -> str:
+        if self.conflict_pages:
+            pages = "、".join(str(number) for number in self.conflict_pages)
+            head = f"第 {pages} 页被不同扫描重复覆盖，存在重扫冲突。"
+        else:
+            head = ""
+        if self.missing_pages:
+            pages = "、".join(str(number) for number in self.missing_pages)
+            tail = f"第 {pages} 页没有有效扫描，需补扫。"
+        else:
+            tail = ""
+        if head or tail:
+            return head + tail
+        return f"全部 {self.total_pages} 页均由唯一有效扫描覆盖。"
+
+    @property
+    def image_note(self) -> str:
+        if self.image_failures:
+            confirmed = (
+                f"已确认 {len(self.reused_images)} 组图片复用；" if self.reused_images else ""
+            )
+            return (
+                confirmed
+                + f"有 {len(self.image_failures)} 张图片读取失败，图像核查结论待核实，"
+                "不能断言没有复用。"
+            )
+        if self.reused_images:
+            return (
+                f"发现 {len(self.reused_images)} 组不同详情复用同一图片字节，"
+                "且各详情页码互不重叠，疑似错配扫描图。"
+            )
+        return f"已核验 {self.verified_image_count} 张图片（{self.unique_image_count} 个唯一地址），未发现内容相同的复用图片。"
 
 
 # ---------------------------------------------------------------------------
@@ -785,6 +880,60 @@ def _ownership_text(issue: str, edition: str) -> str:
     return " ".join(part for part in (issue, edition) if part) or "（未标明）"
 
 
+async def _fingerprint_image(
+    client: httpx.AsyncClient, url: str, semaphore: asyncio.Semaphore
+) -> tuple[str | None, FetchFailure | None]:
+    """Stream one image and hash its actual bytes (never buffer the whole body).
+
+    Returns ``(sha256_hex, failure)``; exactly one of the two is non-empty.
+    """
+    async with semaphore:
+        try:
+            async with client.stream("GET", url) as response:
+                if response.status_code >= 400:
+                    await response.aclose()
+                    return None, FetchFailure(url=url, stage="图片", message=f"HTTP {response.status_code}")
+                digest = hashlib.sha256()
+                async for chunk in response.aiter_bytes(IMAGE_CHUNK_SIZE):
+                    if chunk:
+                        digest.update(chunk)
+        except httpx.HTTPError as exc:
+            return None, FetchFailure(url=url, stage="图片", message=f"{type(exc).__name__}: {exc}")
+        except Exception as exc:  # pragma: no cover - defensive stream teardown
+            return None, FetchFailure(url=url, stage="图片", message=f"图片读取失败: {exc}")
+    return digest.hexdigest(), None
+
+
+def _find_reused_images(accepted: list[ScanSource]) -> list[ReusedImage]:
+    """Group verified scans by image hash and keep disjoint-page reuse groups."""
+    by_hash: dict[str, list[ScanSource]] = {}
+    for scan in accepted:
+        if scan.image_verified and scan.sha256:
+            by_hash.setdefault(scan.sha256, []).append(scan)
+
+    reused: list[ReusedImage] = []
+    for sha, scans in by_hash.items():
+        if len(scans) < 2:
+            continue
+        disjoint = True
+        seen_pages: set[int] = set()
+        for scan in scans:
+            pages = set(scan.page_numbers)
+            if pages & seen_pages:
+                disjoint = False
+                break
+            seen_pages.update(pages)
+        if not disjoint:
+            # Overlapping pages are the existing rescan-conflict case, not
+            # image reuse across distinct paper pages.
+            continue
+        image_urls = list(dict.fromkeys(scan.image_url for scan in scans))
+        reused.append(ReusedImage(sha256=sha, image_urls=image_urls, scans=scans))
+
+    reused.sort(key=lambda group: group.page_numbers[0] if group.page_numbers else 0)
+    return reused
+
+
 async def inspect_issue(directory_url: str, client: httpx.AsyncClient | None = None) -> IssueReport:
     """Read all directory pages and audit the scan coverage of one issue."""
     parsed = urlparse(directory_url)
@@ -815,133 +964,160 @@ async def inspect_issue(directory_url: str, client: httpx.AsyncClient | None = N
         results = await asyncio.gather(
             *[_inspect_detail(client, url, semaphore) for url in detail_urls]
         )
+
+        accepted: list[ScanSource] = []
+        ignored: list[IgnoredScan] = []
+        failures: list[FetchFailure] = list(dir_failures)
+
+        for detail, failure, detail_url, parse_error in results:
+            if failure is not None:
+                failures.append(failure)
+                continue
+            if detail is None:
+                ignored.append(
+                    IgnoredScan(
+                        detail_url=detail_url,
+                        issue="",
+                        edition="",
+                        pages_text="",
+                        image_url="",
+                        reason=parse_error or "详情页无法解析",
+                    )
+                )
+                continue
+
+            if not detail.issue or not detail.edition:
+                ignored.append(
+                    IgnoredScan(
+                        detail_url=detail_url,
+                        issue=detail.issue,
+                        edition=detail.edition,
+                        pages_text=detail.pages_text,
+                        image_url=detail.image_url,
+                        reason="详情未标明所属期版，无法确认归属",
+                    )
+                )
+                continue
+            if (
+                normalize_issue(detail.issue) != normalize_issue(metadata.issue)
+                or normalize_edition(detail.edition) != normalize_edition(metadata.edition)
+            ):
+                ignored.append(
+                    IgnoredScan(
+                        detail_url=detail_url,
+                        issue=detail.issue,
+                        edition=detail.edition,
+                        pages_text=detail.pages_text,
+                        image_url=detail.image_url,
+                        reason=(
+                            "期版不一致：目录为 "
+                            f"{_ownership_text(metadata.issue, metadata.edition)}，"
+                            f"详情为 {_ownership_text(detail.issue, detail.edition)}"
+                        ),
+                    )
+                )
+                continue
+            if not detail.image_url:
+                ignored.append(
+                    IgnoredScan(
+                        detail_url=detail_url,
+                        issue=detail.issue,
+                        edition=detail.edition,
+                        pages_text=detail.pages_text,
+                        image_url="",
+                        reason="缺少图片链接，不能作为有效扫描",
+                    )
+                )
+                continue
+            if not detail.page_numbers:
+                ignored.append(
+                    IgnoredScan(
+                        detail_url=detail_url,
+                        issue=detail.issue,
+                        edition=detail.edition,
+                        pages_text=detail.pages_text,
+                        image_url=detail.image_url,
+                        reason="未给出可识别的页码",
+                    )
+                )
+                continue
+
+            valid_pages = [number for number in detail.page_numbers if 1 <= number <= total_pages]
+            notes: list[str] = []
+            if len(valid_pages) != len(detail.page_numbers):
+                notes.append(f"部分页码超出总页数（1–{total_pages}）")
+            if not valid_pages:
+                ignored.append(
+                    IgnoredScan(
+                        detail_url=detail_url,
+                        issue=detail.issue,
+                        edition=detail.edition,
+                        pages_text=detail.pages_text,
+                        image_url=detail.image_url,
+                        reason=f"页码超出总页数范围（共 {total_pages} 页）",
+                    )
+                )
+                continue
+
+            accepted.append(
+                ScanSource(
+                    code=f"S{len(accepted) + 1:02d}",
+                    detail_url=detail_url,
+                    image_url=detail.image_url,
+                    pages_text=detail.pages_text,
+                    page_numbers=sorted(set(valid_pages)),
+                    issue=detail.issue,
+                    edition=detail.edition,
+                    notes=notes,
+                )
+            )
+
+        coverage: dict[int, list[ScanSource]] = {number: [] for number in range(1, total_pages + 1)}
+        for scan in accepted:
+            for number in scan.page_numbers:
+                if number in coverage:
+                    coverage[number].append(scan)
+
+        # Download each distinct image URL exactly once, streaming the bytes
+        # through a bounded concurrency gate, and hash the actual payload.
+        unique_image_urls = list(dict.fromkeys(scan.image_url for scan in accepted))
+        image_semaphore = asyncio.Semaphore(IMAGE_CONCURRENCY)
+        fingerprints = await asyncio.gather(
+            *[_fingerprint_image(client, url, image_semaphore) for url in unique_image_urls]
+        )
+        image_by_url: dict[str, str] = {}
+        for url, (digest, failure) in zip(unique_image_urls, fingerprints):
+            if failure is not None:
+                failures.append(failure)
+            else:
+                image_by_url[url] = digest
+
+        for scan in accepted:
+            digest = image_by_url.get(scan.image_url)
+            if digest is not None:
+                scan.sha256 = digest
+                scan.image_verified = True
+
+        reused = _find_reused_images(accepted)
+        pages = [
+            PageFinding(number=number, sources=coverage[number])
+            for number in range(1, total_pages + 1)
+        ]
+        return IssueReport(
+            directory_url=directory_url,
+            issue_no=metadata.issue,
+            edition=metadata.edition,
+            total_pages=total_pages,
+            pages=pages,
+            accepted_scans=accepted,
+            ignored_scans=ignored,
+            failures=failures,
+            directory_pages=directory_pages,
+            warnings=warnings,
+            reused_images=reused,
+            unique_image_count=len(unique_image_urls),
+            verified_image_count=len(image_by_url),
+        )
     finally:
         if own_client:
             await client.aclose()
-
-    accepted: list[ScanSource] = []
-    ignored: list[IgnoredScan] = []
-    failures: list[FetchFailure] = list(dir_failures)
-
-    for detail, failure, detail_url, parse_error in results:
-        if failure is not None:
-            failures.append(failure)
-            continue
-        if detail is None:
-            ignored.append(
-                IgnoredScan(
-                    detail_url=detail_url,
-                    issue="",
-                    edition="",
-                    pages_text="",
-                    image_url="",
-                    reason=parse_error or "详情页无法解析",
-                )
-            )
-            continue
-
-        if not detail.issue or not detail.edition:
-            ignored.append(
-                IgnoredScan(
-                    detail_url=detail_url,
-                    issue=detail.issue,
-                    edition=detail.edition,
-                    pages_text=detail.pages_text,
-                    image_url=detail.image_url,
-                    reason="详情未标明所属期版，无法确认归属",
-                )
-            )
-            continue
-        if (
-            normalize_issue(detail.issue) != normalize_issue(metadata.issue)
-            or normalize_edition(detail.edition) != normalize_edition(metadata.edition)
-        ):
-            ignored.append(
-                IgnoredScan(
-                    detail_url=detail_url,
-                    issue=detail.issue,
-                    edition=detail.edition,
-                    pages_text=detail.pages_text,
-                    image_url=detail.image_url,
-                    reason=(
-                        "期版不一致：目录为 "
-                        f"{_ownership_text(metadata.issue, metadata.edition)}，"
-                        f"详情为 {_ownership_text(detail.issue, detail.edition)}"
-                    ),
-                )
-            )
-            continue
-        if not detail.image_url:
-            ignored.append(
-                IgnoredScan(
-                    detail_url=detail_url,
-                    issue=detail.issue,
-                    edition=detail.edition,
-                    pages_text=detail.pages_text,
-                    image_url="",
-                    reason="缺少图片链接，不能作为有效扫描",
-                )
-            )
-            continue
-        if not detail.page_numbers:
-            ignored.append(
-                IgnoredScan(
-                    detail_url=detail_url,
-                    issue=detail.issue,
-                    edition=detail.edition,
-                    pages_text=detail.pages_text,
-                    image_url=detail.image_url,
-                    reason="未给出可识别的页码",
-                )
-            )
-            continue
-
-        valid_pages = [number for number in detail.page_numbers if 1 <= number <= total_pages]
-        notes: list[str] = []
-        if len(valid_pages) != len(detail.page_numbers):
-            notes.append(f"部分页码超出总页数（1–{total_pages}）")
-        if not valid_pages:
-            ignored.append(
-                IgnoredScan(
-                    detail_url=detail_url,
-                    issue=detail.issue,
-                    edition=detail.edition,
-                    pages_text=detail.pages_text,
-                    image_url=detail.image_url,
-                    reason=f"页码超出总页数范围（共 {total_pages} 页）",
-                )
-            )
-            continue
-
-        accepted.append(
-            ScanSource(
-                code=f"S{len(accepted) + 1:02d}",
-                detail_url=detail_url,
-                image_url=detail.image_url,
-                pages_text=detail.pages_text,
-                page_numbers=sorted(set(valid_pages)),
-                issue=detail.issue,
-                edition=detail.edition,
-                notes=notes,
-            )
-        )
-
-    coverage: dict[int, list[ScanSource]] = {number: [] for number in range(1, total_pages + 1)}
-    for scan in accepted:
-        for number in scan.page_numbers:
-            if number in coverage:
-                coverage[number].append(scan)
-
-    pages = [PageFinding(number=number, sources=coverage[number]) for number in range(1, total_pages + 1)]
-    return IssueReport(
-        directory_url=directory_url,
-        issue_no=metadata.issue,
-        edition=metadata.edition,
-        total_pages=total_pages,
-        pages=pages,
-        accepted_scans=accepted,
-        ignored_scans=ignored,
-        failures=failures,
-        directory_pages=directory_pages,
-        warnings=warnings,
-    )

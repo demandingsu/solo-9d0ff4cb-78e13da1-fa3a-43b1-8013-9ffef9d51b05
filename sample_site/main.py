@@ -257,6 +257,18 @@ async def placeholder_image(filename: str) -> Response:
     return Response(content=svg, media_type="image/svg+xml")
 
 
+@app.get("/img/copy/{filename}")
+async def copied_placeholder_image(filename: str) -> Response:
+    """A different URL whose response bytes are identical to /img/{filename}."""
+    return await placeholder_image(filename)
+
+
+@app.get("/img/missing/{filename}")
+async def missing_placeholder_image(filename: str) -> Response:
+    """Simulate an image link that can no longer be read (HTTP 404)."""
+    raise HTTPException(status_code=404, detail="扫描图片缺失，无法下载")
+
+
 @app.get("/healthz")
 async def healthz() -> dict:
     return {"ok": True, "service": "sample-site"}

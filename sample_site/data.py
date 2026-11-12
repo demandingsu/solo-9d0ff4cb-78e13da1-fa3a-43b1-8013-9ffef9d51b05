@@ -57,9 +57,43 @@ ISSUES: dict[str, dict] = {
             {"id": "c9", "pages": "10", "image": True},
         ],
     },
+    "reuse": {
+        "slug": "reuse",
+        "issue": "2024-05-04",
+        "edition": "第3版",
+        "total_pages": 6,
+        "title": "示例 D · 图片错配复用",
+        "description": "页码覆盖齐全且互不重叠，但两个详情复用了同一扫描图（同地址与不同地址各一组）。",
+        "expected": "不合格",
+        "scans": [
+            {"id": "r1", "pages": "1", "image": True},
+            {"id": "r2", "pages": "2-3", "image": True},
+            # Distinct detail, disjoint page, but the very same image URL as r1.
+            {"id": "r3", "pages": "4", "image": True, "image_of": "r1"},
+            # Different URL that serves byte-identical content to r2's image.
+            {"id": "r4", "pages": "5", "image": True, "image_copy_of": "r2"},
+            {"id": "r5", "pages": "6", "image": True},
+        ],
+    },
+    "badimg": {
+        "slug": "badimg",
+        "issue": "2024-05-05",
+        "edition": "第3版",
+        "total_pages": 5,
+        "title": "示例 E · 图片读取失败",
+        "description": "一张扫描图返回 404，图像核查只能待核实；已确认的图片复用仍照常列出。",
+        "expected": "待核实",
+        "scans": [
+            {"id": "e1", "pages": "1", "image": True},
+            {"id": "e2", "pages": "2", "image": True, "image_broken": True},
+            # Confirmed reuse must remain visible even though another image failed.
+            {"id": "e3", "pages": "3", "image": True, "image_of": "e1"},
+            {"id": "e4", "pages": "4-5", "image": True},
+        ],
+    },
 }
 
-ISSUE_ORDER = ["clean", "conflict", "pending"]
+ISSUE_ORDER = ["clean", "conflict", "pending", "reuse", "badimg"]
 PAGE_SIZE = 3
 
 
@@ -75,5 +109,26 @@ def scan_edition(scan: dict, issue: dict) -> str:
     return scan.get("edition", issue["edition"])
 
 
+def _find_scan(issue: dict, scan_id: str) -> dict | None:
+    return next((item for item in issue["scans"] if item["id"] == scan_id), None)
+
+
 def scan_image_path(slug: str, scan: dict) -> str:
+    """Return the image URL for a scan, including reuse / failure simulations.
+
+    * ``image_of``: point at another scan's image URL (same address, same bytes).
+    * ``image_copy_of``: a different URL whose response bytes are identical.
+    * ``image_broken``: an image link that answers HTTP 404.
+    """
+    issue = ISSUES[slug]
+    if scan.get("image_of"):
+        target = _find_scan(issue, scan["image_of"])
+        if target is not None:
+            return f"/img/{slug}-{target['id']}.svg"
+    if scan.get("image_copy_of"):
+        target = _find_scan(issue, scan["image_copy_of"])
+        if target is not None:
+            return f"/img/copy/{slug}-{target['id']}.svg"
+    if scan.get("image_broken"):
+        return f"/img/missing/{slug}-{scan['id']}.svg"
     return f"/img/{slug}-{scan['id']}.svg"

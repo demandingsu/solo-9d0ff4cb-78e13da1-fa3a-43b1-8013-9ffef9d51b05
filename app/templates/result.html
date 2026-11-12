@@ -21,6 +21,28 @@
   {% endif %}
 </div>
 
+<section class="verdict-grid">
+  <article class="verdict-card verdict-{{ report.coverage_status_key }}">
+    <header>
+      <h2>页码覆盖结论</h2>
+      <span class="badge badge-{{ report.coverage_status_key }}">{{ report.coverage_status }}</span>
+    </header>
+    <p>{{ report.coverage_note }}</p>
+    <p class="muted small">依据详情的期版一致性与页码覆盖情况独立判定，不受图片下载结果影响。</p>
+  </article>
+  <article class="verdict-card verdict-{{ report.image_status_key }}">
+    <header>
+      <h2>图像核查结论</h2>
+      <span class="badge badge-{{ report.image_status_key }}">{{ report.image_status }}</span>
+    </header>
+    <p>{{ report.image_note }}</p>
+    <p class="muted small">
+      已下载 {{ report.unique_image_count }} 个唯一图片地址、核验 {{ report.verified_image_count }} 张，
+      按实际字节计算 SHA-256；同一地址只下载一次。
+    </p>
+  </article>
+</section>
+
 <section class="stats">
   <div class="stat">
     <span class="stat-label">总页数</span>
@@ -107,12 +129,12 @@
 <section class="section">
   <div class="section-heading">
     <h2>已采用扫描</h2>
-    <p>{{ report.accepted_scans|length }} 个详情通过期版与图片校验。</p>
+    <p>{{ report.accepted_scans|length }} 个详情通过期版与图片校验，图片按字节计算 SHA-256。</p>
   </div>
   <div class="table-wrap">
     <table>
       <thead>
-        <tr><th>编号</th><th>详情页</th><th>所属期版</th><th>页码</th><th>图片</th><th>备注</th></tr>
+        <tr><th>编号</th><th>详情页</th><th>所属期版</th><th>页码</th><th>图片</th><th>SHA-256</th><th>备注</th></tr>
       </thead>
       <tbody>
       {% for scan in report.accepted_scans %}
@@ -122,12 +144,59 @@
           <td>{{ scan.issue }} · {{ scan.edition }}</td>
           <td>{{ scan.pages_text }}</td>
           <td><a href="{{ scan.image_url }}" target="_blank" rel="noopener">图片 ↗</a></td>
+          <td class="hash-cell">
+            {% if scan.image_verified %}
+            <code class="hash" title="{{ scan.sha256 }}">{{ scan.sha256[:16] }}…</code>
+            {% else %}
+            <span class="chip chip-missing">读取失败</span>
+            {% endif %}
+          </td>
           <td class="muted">{{ scan.notes|join('；') if scan.notes else '—' }}</td>
         </tr>
       {% endfor %}
       </tbody>
     </table>
   </div>
+</section>
+{% endif %}
+
+{% if report.reused_images %}
+<section class="section">
+  <div class="section-heading">
+    <h2>疑似图片错配复用</h2>
+    <p>下列详情的页码集合互不重叠（即不同纸页），图片实际字节却完全相同；同一跨页详情只计一次。</p>
+  </div>
+  {% for group in report.reused_images %}
+  <article class="reuse-card">
+    <header class="reuse-head">
+      <span class="badge badge-bad">复用 {{ loop.index }}</span>
+      <span>涉及页码：<strong>第 {{ group.page_numbers|join('、') }} 页</strong></span>
+    </header>
+    <p class="muted small hash-line">相同字节 SHA-256：<code class="hash">{{ group.sha256 }}</code></p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>扫描编号</th><th>页码</th><th>详情来源</th><th>图片来源</th></tr>
+        </thead>
+        <tbody>
+        {% for scan in group.scans %}
+          <tr>
+            <td><span class="scan-code">{{ scan.code }}</span></td>
+            <td>{{ scan.pages_text }}</td>
+            <td><a href="{{ scan.detail_url }}" target="_blank" rel="noopener" class="url-text">{{ scan.detail_url }}</a></td>
+            <td><a href="{{ scan.image_url }}" target="_blank" rel="noopener" class="url-text">{{ scan.image_url }}</a></td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% if group.image_urls|length > 1 %}
+    <p class="muted small">这些图片地址不同但响应字节一致：{{ group.image_urls|length }} 个地址，内容均相同。</p>
+    {% else %}
+    <p class="muted small">多个详情指向了同一个图片地址。</p>
+    {% endif %}
+  </article>
+  {% endfor %}
 </section>
 {% endif %}
 

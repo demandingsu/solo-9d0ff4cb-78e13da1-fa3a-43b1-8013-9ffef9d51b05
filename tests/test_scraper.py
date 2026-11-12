@@ -1,3 +1,5 @@
+import hashlib
+
 import httpx
 import pytest
 
@@ -108,3 +110,130 @@ def test_ownership_and_tokens_are_normalised():
     assert normalize_edition("第3版") == "3"
     assert normalize_edition("3版") == "3"
     assert normalize_edition("第4版") != normalize_edition("第3版")
+
+
+@pytest.mark.asyncio
+async def test_disjoint_pages_with_identical_images_are_listed_as_reuse():
+    async with make_client() as client:
+        report = await inspect_issue(
+            "http://sample.test/issues/reuse/page/1.html", client=client
+        )
+
+    # Page coverage itself is complete and conflict-free.
+    assert report.coverage_status == "合格"
+    assert [page.status for page in report.pages] == ["covered"] * 6
+    assert report.conflict_pages == []
+    assert report.missing_pages == []
+
+    # Image audit must fail the issue because of byte-identical reused images.
+    assert report.image_status == "不合格"
+    assert report.status == "不合格"
+    assert len(report.reused_images) == 2
+
+    by_pages = {
+        tuple(group.page_numbers): group for group in report.reused_images
+    }
+    # Same image URL reused across page 1 and page 4.
+    group_same_url = by_pages[(1, 4)]
+    assert len(group_same_url.scans) == 2
+    assert len(set(group_same_url.image_urls)) == 1
+    assert all(scan.image_verified for scan in group_same_url.scans)
+
+    # Different URLs serving identical bytes across the 2-3 spread and page 5.
+    group_copy = by_pages[(2, 3, 5)]
+    assert len(group_copy.image_urls) == 2
+    assert len(set(group_copy.image_urls)) == 2
+
+    # Every scan in a reuse group shares the same hash and every group member
+    # is a distinct detail (a spread detail still counts only once).
+    for group in report.reused_images:
+        assert len({scan.detail_url for scan in group.scans}) == len(group.scans)
+        assert len({scan.sha256 for scan in group.scans}) == 1
+        assert group.scans[0].sha256 == group.sha256
+
+    # The unique address is downloaded once even though two details use it.
+    assert report.unique_image_count == 4
+    assert report.verified_image_count == 4
+
+
+@pytest.mark.asyncio
+async def test_reuse_hash_matches_actual_streamed_bytes():
+    async with make_client() as client:
+        report = await inspect_issue(
+            "http://sample.test/issues/reuse/page/1.html", client=client
+        )
+        response = await client.get(report.reused_images[0].image_urls[0])
+
+    expected = hashlib.sha256(response.content).hexdigest()
+    assert report.reused_images[0].sha256 == expected
+    assert all(scan.sha256 == expected for scan in report.reused_images[0].scans)
+
+
+@pytest.mark.asyncio
+async def test_image_failure_keeps_confirmed_reuse_but_pends_image_audit():
+    async with make_client() as client:
+        report = await inspect_issue(
+            "http://sample.test/issues/badimg/page/1.html", client=client
+        )
+
+    # Coverage is complete; the image failure does not change page findings.
+    assert report.coverage_status == "合格"
+    assert [page.status for page in report.pages] == ["covered"] * 5
+
+    assert report.image_status == "待核实"
+    assert report.status == "待核实"
+    image_failures = report.image_failures
+    assert len(image_failures) == 1
+    assert image_failures[0].stage == "图片"
+    assert "HTTP 404" in image_failures[0].message
+    assert "/img/missing/" in image_failures[0].url
+
+    # The confirmed reuse (page 1 / page 3) is still surfaced.
+    assert len(report.reused_images) == 1
+    group = report.reused_images[0]
+    assert group.page_numbers == [1, 3]
+
+    # The failed scan is neither marked verified nor dropped from coverage.
+    failed_scan = next(
+        scan for scan in report.accepted_scans if not scan.image_verified
+    )
+    assert failed_scan.pages_text == "2"
+    assert failed_scan.sha256 == ""
+    assert report.verified_image_count == report.unique_image_count - 1
+
+
+@pytest.mark.asyncio
+async def test_clean_issue_passes_image_audit_with_distinct_hashes():
+    async with make_client() as client:
+        report = await inspect_issue(
+            "http://sample.test/issues/clean/page/1.html", client=client
+        )
+
+    assert report.image_status == "合格"
+    assert report.reused_images == []
+    assert report.image_failures == []
+    assert report.verified_image_count == report.unique_image_count
+    assert len({scan.sha256 for scan in report.accepted_scans}) == len(
+        report.accepted_scans
+    )
+
+
+@pytest.mark.asyncio
+async def test_each_unique_image_url_is_downloaded_only_once(monkeypatch):
+    from app import scraper
+
+    calls: list[str] = []
+    original = scraper._fingerprint_image
+
+    async def counting_fingerprint(client, url, semaphore):
+        calls.append(url)
+        return await original(client, url, semaphore)
+
+    monkeypatch.setattr(scraper, "_fingerprint_image", counting_fingerprint)
+    async with make_client() as client:
+        report = await inspect_issue(
+            "http://sample.test/issues/reuse/page/1.html", client=client
+        )
+
+    assert len(calls) == report.unique_image_count
+    assert len(calls) == len(set(calls))

@@ -47,6 +47,18 @@ DEMO_ISSUES = [
         "description": "详情抓取失败，整期待核实。",
         "expected": "待核实",
     },
+    {
+        "path": "/issues/reuse/page/1.html",
+        "title": "示例 D · 图片错配复用",
+        "description": "页码覆盖齐全，但两组不同详情复用了相同图片字节。",
+        "expected": "不合格",
+    },
+    {
+        "path": "/issues/badimg/page/1.html",
+        "title": "示例 E · 图片读取失败",
+        "description": "一张扫描图 404，图像核查看待核实；已确认复用仍列出。",
+        "expected": "待核实",
+    },
 ]
 
 
@@ -153,7 +165,7 @@ if SAMPLE_SITE_BASE_URL:
     @app.get(f"{SAMPLE_SITE_PREFIX}/{{path:path}}", response_class=Response)
     async def sample_proxy(request: Request, path: str) -> Response:
         """Serve the demo sample site through this app (same-origin demo links)."""
-        target = f"{SAMPLE_SITE_BASE_URL}/{quote(path, safe='/')}"
+        target = f"{SAMPLE_SITE_BASE_URL.rstrip('/')}/{quote(path, safe='/').lstrip('/')}"
         if request.url.query:
             target += f"?{request.url.query}"
         try:
